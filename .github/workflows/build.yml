@@ -1,0 +1,103 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Preparar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Chaquopy usa Python 3.11 para compilar módulos Python.
+      - name: Preparar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Encontrar e extrair o projeto ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, zipfile
+          from pathlib import Path
+
+          repo = Path(os.environ['GITHUB_WORKSPACE'])
+          candidates = sorted(
+              p for p in repo.glob('**/*.zip')
+              if '.git' not in p.parts and 'build' not in p.parts
+          )
+          chosen = None
+          for archive in candidates:
+              try:
+                  with zipfile.ZipFile(archive) as z:
+                      names = z.namelist()
+                      if any(n.endswith(('settings.gradle', 'settings.gradle.kts')) for n in names):
+                          chosen = archive
+                          break
+              except (OSError, zipfile.BadZipFile):
+                  continue
+
+          if chosen is None:
+              raise SystemExit('ERRO: não encontrei ZIP válido contendo settings.gradle ou settings.gradle.kts.')
+
+          dest = Path('/tmp/codeinjector-source')
+          dest.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(chosen) as z:
+              z.extractall(dest)
+          settings = list(dest.rglob('settings.gradle')) + list(dest.rglob('settings.gradle.kts'))
+          if not settings:
+              raise SystemExit('ERRO: o ZIP foi extraído, mas o arquivo settings.gradle(.kts) não foi encontrado.')
+          # Se houver mais de um, usa o primeiro projeto Gradle encontrado.
+          project = settings[0].parent
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f'PROJECT_DIR={project}\n')
+          print(f'ZIP selecionado: {chosen.name}')
+          print(f'Projeto Gradle: {project}')
+          PY
+
+      - name: Verificar estrutura do projeto
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$PROJECT_DIR/app/build.gradle" -o -f "$PROJECT_DIR/app/build.gradle.kts"
+          test -f "$PROJECT_DIR/gradlew" || true
+          echo "Projeto localizado em: $PROJECT_DIR"
+
+      - name: Verificar projeto
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          if [ -f tools/verify_project.py ]; then
+            python tools/verify_project.py
+          else
+            echo 'Verificação estática específica não encontrada; continuando com a compilação.'
+          fi
+
+      - name: Compilar APK Debug
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publicar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeInjector-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
